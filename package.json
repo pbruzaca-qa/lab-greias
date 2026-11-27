@@ -1,0 +1,33 @@
+{
+  "name": "lab-greias",
+  "version": "1.0.0",
+  "description": "Central CLI orchestrator for the Lab Gréias multi-agent QA simulation architecture (Pênfredo, Dino, and Ênio).",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "test:all": "node index.js all 60"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/pbruzaca-qa/lab-greias.git"
+  },
+  "keywords": [
+    "qa",
+    "multi-agent",
+    "simulation",
+    "gemini",
+    "fintech"
+  ],
+  "author": "Paulo Bruzaca",
+  "license": "GPL-3.0-or-later",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/pbruzaca-qa/lab-greias/issues"
+  },
+  "homepage": "https://github.com/pbruzaca-qa/lab-greias#readme",
+  "dependencies": {
+    "@google/genai": "^2.24.0",
+    "dotenv": "^18.0.4",
+    "googleapis": "^182.0.0"
+  }
+}

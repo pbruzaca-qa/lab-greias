@@ -1,0 +1,12 @@
+# Environment variables and cloud credentials (CRITICAL)
+.env
+.env.local
+credentials.json
+*-credentials.json
+
+# Node.js dependencies
+node_modules/
+npm-debug.log*
+
+# System and runtime logs
+*.log
