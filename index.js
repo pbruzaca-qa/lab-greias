@@ -10,6 +10,10 @@ const AGENT_MODELS = {
   dev: process.env.DEV_MODEL || process.env.GEMINI_MODEL || 'gemini-3.6-flash',
 };
 
+const EVIDENCE_BASE_URL =
+  process.env.EVIDENCE_BASE_URL ||
+  'https://github.com/pbruzaca-qa/lab-greias/blob/main/docs/evidence';
+
 const EXPLORATORY_FAULT_RATE = 0.15;
 const ALLOWED_HTTP_STATUSES = [200, 400, 404, 409, 422, 500, 504];
 const ALLOWED_BUG_TYPES = ['none', 'race_condition', 'webhook_timeout'];
@@ -95,6 +99,27 @@ const CONDITIONS = [
 ];
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+function formatSaoPauloTimestamp(date = new Date()) {
+  return new Intl.DateTimeFormat('sv-SE', {
+    timeZone: 'America/Sao_Paulo',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false,
+  }).format(date);
+}
+
+function buildRunId(index, date = new Date()) {
+  const compact = formatSaoPauloTimestamp(date)
+    .replace(/[-:]/g, '')
+    .replace(' ', '-');
+  const seq = String(index + 1).padStart(2, '0');
+  return `RUN-${compact}-${seq}`;
+}
 
 function isPlainObject(value) {
   return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
@@ -259,6 +284,51 @@ function evaluateDevOracle(rawText, condition) {
   return { passed: issues.length === 0, issues, parsed };
 }
 
+function classifyExecutionMetrics({ poOracle, smOracle, devOracle, devJson }) {
+  const poFailed = !poOracle.passed;
+  const smFailed = !smOracle.passed;
+  const devFailed = !devOracle.passed;
+  const failedLayers = (poFailed ? 1 : 0) + (smFailed ? 1 : 0) + (devFailed ? 1 : 0);
+
+  const oracleResult = failedLayers === 0 ? 'PASS' : 'MISMATCH';
+  const status = failedLayers === 0 ? 'PASS' : 'FAIL';
+
+  let defectType = 'none';
+  let severity = 'none';
+
+  if (failedLayers > 1) {
+    defectType = 'multi_layer_defect';
+    severity = devJson?.bug_type === 'race_condition' ? 'critical' : 'high';
+  } else if (poFailed) {
+    defectType = 'po_requirement_defect';
+    severity = 'medium';
+  } else if (smFailed) {
+    defectType = 'sm_testdata_defect';
+    severity = 'medium';
+  } else if (devFailed) {
+    if (devJson?.bug_type === 'race_condition') {
+      defectType = 'race_condition';
+      severity = 'critical';
+    } else if (devJson?.bug_type === 'webhook_timeout') {
+      defectType = 'webhook_timeout';
+      severity = 'high';
+    } else {
+      defectType = 'dev_contract_mismatch';
+      severity = 'high';
+    }
+  } else if (devJson?.bug_triggered === true) {
+    defectType = devJson.bug_type || 'none';
+    severity =
+      defectType === 'race_condition'
+        ? 'critical'
+        : defectType === 'webhook_timeout'
+          ? 'high'
+          : 'none';
+  }
+
+  return { status, defectType, severity, oracleResult };
+}
+
 async function saveToSheets(testReport) {
   try {
     const credentialsPath = path.join(__dirname, 'credentials.json');
@@ -289,31 +359,36 @@ async function saveToSheets(testReport) {
         testReport.bugType,
         testReport.httpStatus,
         testReport.message,
+        testReport.runId,
+        testReport.scenarioId,
+        testReport.executionMode,
+        testReport.status,
+        testReport.defectType,
+        testReport.severity,
+        testReport.oracleResult,
+        testReport.evidenceLink,
       ],
     ];
 
     await sheets.spreadsheets.values.append({
       spreadsheetId,
-      range: 'A:G',
+      range: 'A:O',
       valueInputOption: 'USER_ENTERED',
       resource: { values },
     });
 
-    console.log('📊 [Sheets] Test execution saved to spreadsheet successfully!');
+    console.log(`📊 [Sheets] Run ${testReport.runId} saved to spreadsheet (A:O)!`);
   } catch (error) {
     console.error('❌ [Sheets] Failed to save execution data:', error.message);
   }
 }
 
-function saveEvidenceReport(runResults, targetLabel) {
+function saveEvidenceReport(runResults, targetLabel, filename) {
   if (runResults.length === 0) return;
 
   const evidenceDir = path.join(__dirname, 'docs', 'evidence');
   fs.mkdirSync(evidenceDir, { recursive: true });
 
-  const fileTimestamp = new Date().toISOString().slice(0, 19).replace(/:/g, '-');
-  const safeTarget = targetLabel.replace(/[^a-zA-Z0-9._-]/g, '_');
-  const filename = `run-${fileTimestamp}_${safeTarget}.md`;
   const filePath = path.join(evidenceDir, filename);
 
   const lines = [];
@@ -329,9 +404,9 @@ function saveEvidenceReport(runResults, targetLabel) {
   lines.push('## Summary');
   lines.push('');
   lines.push(
-    '| Run | Case / Mode | Expected HTTP | Observed HTTP | Pênfredo (PO) | Dino (SM) | Ênio (Dev) | Oracle Verdict |'
+    '| Run | Run ID | Case / Mode | Expected HTTP | Observed HTTP | Pênfredo (PO) | Dino (SM) | Ênio (Dev) | Defect Type | Severity | Oracle Verdict |'
   );
-  lines.push('| --- | --- | --- | --- | --- | --- | --- | --- |');
+  lines.push('| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |');
 
   runResults.forEach((item, idx) => {
     const expected = item.expectedStatuses ? item.expectedStatuses.join(' / ') : '200 (free)';
@@ -339,8 +414,10 @@ function saveEvidenceReport(runResults, targetLabel) {
     const poStatus = item.poOracle?.passed ? 'PASS' : 'MISMATCH';
     const smStatus = item.smOracle?.passed ? 'PASS' : 'MISMATCH';
     const devStatus = item.devOracle?.passed ? 'PASS' : 'MISMATCH';
+    const defectType = item.defectType || 'none';
+    const severity = item.severity || 'none';
     lines.push(
-      `| ${idx + 1} | \`${item.caseId}\` | ${expected} | ${observed} | ${poStatus} | ${smStatus} | ${devStatus} | **${item.verdict}** |`
+      `| ${idx + 1} | \`${item.runId}\` | \`${item.caseId}\` | ${expected} | ${observed} | ${poStatus} | ${smStatus} | ${devStatus} | \`${defectType}\` | \`${severity}\` | **${item.verdict}** |`
     );
   });
 
@@ -349,9 +426,12 @@ function saveEvidenceReport(runResults, targetLabel) {
   runResults.forEach((item, idx) => {
     lines.push(`---`);
     lines.push('');
-    lines.push(`## Run ${idx + 1}: \`${item.caseId}\` (${item.mode})`);
+    lines.push(`## Run ${idx + 1}: \`${item.caseId}\` (${item.mode}) — \`${item.runId}\``);
     lines.push('');
     lines.push(`- **Timestamp:** ${item.timestamp}`);
+    lines.push(`- **Status:** ${item.status || item.verdict}`);
+    lines.push(`- **Defect Type:** \`${item.defectType || 'none'}\``);
+    lines.push(`- **Severity:** \`${item.severity || 'none'}\``);
     lines.push(`- **Oracle Verdict:** **${item.verdict}**`);
 
     if (item.error) {
@@ -401,12 +481,14 @@ function saveEvidenceReport(runResults, targetLabel) {
   console.log(`📝 [Evidence] Report saved to docs/evidence/${filename}`);
 }
 
-async function runAgents(condition) {
-  const timestamp = new Date().toLocaleString('en-US', {
-    timeZone: 'America/Sao_Paulo',
-  });
+async function runAgents(condition, meta) {
+  const now = new Date();
+  const timestamp = formatSaoPauloTimestamp(now);
+  const runId = meta.runId;
+  const evidenceLink = meta.evidenceLink;
   const isExploratory = !condition;
   const caseId = condition ? condition.id : 'EXPLORATORY';
+  const executionMode = isExploratory ? 'exploratory' : 'deterministic';
 
   const faultRolls = isExploratory
     ? {
@@ -443,11 +525,15 @@ async function runAgents(condition) {
     if (!apiKey) {
       console.error('❌ Error: GEMINI_API_KEY not found in .env file.');
       return {
+        runId,
         caseId,
-        mode: isExploratory ? 'exploratory' : 'deterministic',
+        mode: executionMode,
         timestamp,
         expectedStatuses: condition ? condition.expectedStatuses : null,
         observedStatus: null,
+        status: 'ERROR',
+        defectType: 'runtime_error',
+        severity: 'critical',
         verdict: 'ERROR',
         error: 'GEMINI_API_KEY not found in .env file.',
       };
@@ -511,16 +597,22 @@ async function runAgents(condition) {
     console.log('\n💬 Response from Ênio (Dev):\n', devText);
 
     const devOracle = evaluateDevOracle(devText, condition);
-    const allPassed = poOracle.passed && smOracle.passed && devOracle.passed;
-    const verdict = allPassed ? 'PASS' : 'MISMATCH';
+    const devJson = devOracle.parsed;
+
+    const { status, defectType, severity, oracleResult } = classifyExecutionMetrics({
+      poOracle,
+      smOracle,
+      devOracle,
+      devJson,
+    });
 
     console.log('\n🔎 [Test Oracle Summary]');
+    console.log(` Run ID: ${runId}`);
     console.log(` Pênfredo (PO): ${poOracle.passed ? 'PASS' : `MISMATCH -> ${poOracle.issues.join(' | ')}`}`);
     console.log(` Dino (SM): ${smOracle.passed ? 'PASS' : `MISMATCH -> ${smOracle.issues.join(' | ')}`}`);
     console.log(` Ênio (Dev): ${devOracle.passed ? 'PASS' : `MISMATCH -> ${devOracle.issues.join(' | ')}`}`);
-    console.log(` Overall: ${verdict}`);
+    console.log(` Classification: status=${status} | defect_type=${defectType} | severity=${severity} | oracle=${oracleResult}`);
 
-    const devJson = devOracle.parsed;
     const testReport = {
       timestamp,
       sprintId,
@@ -531,17 +623,29 @@ async function runAgents(condition) {
       bugType: devJson?.bug_type || 'none',
       httpStatus: devJson?.request_status ?? 500,
       message: devJson?.response_mock?.message || 'Invalid or empty Dev payload',
+      runId,
+      scenarioId: caseId,
+      executionMode,
+      status,
+      defectType,
+      severity,
+      oracleResult,
+      evidenceLink,
     };
 
     await saveToSheets(testReport);
 
     return {
+      runId,
       caseId,
-      mode: isExploratory ? 'exploratory' : 'deterministic',
+      mode: executionMode,
       timestamp,
       expectedStatuses: condition ? condition.expectedStatuses : null,
       observedStatus: devJson?.request_status ?? null,
-      verdict,
+      status,
+      defectType,
+      severity,
+      verdict: oracleResult,
       faultRolls,
       poOracle,
       smOracle,
@@ -555,11 +659,15 @@ async function runAgents(condition) {
   } catch (error) {
     console.error('❌ Error executing Lab Gréias pipeline:', error.message);
     return {
+      runId,
       caseId,
-      mode: isExploratory ? 'exploratory' : 'deterministic',
+      mode: executionMode,
       timestamp,
       expectedStatuses: condition ? condition.expectedStatuses : null,
       observedStatus: null,
+      status: 'ERROR',
+      defectType: 'runtime_error',
+      severity: 'critical',
       verdict: 'ERROR',
       error: error.message,
     };
@@ -607,17 +715,47 @@ function resolveConditions(targetArg) {
   return selected.length > 0 ? selected : null;
 }
 
+function parseExploratoryTarget(targetArg) {
+  const normalized = targetArg.trim().toLowerCase();
+  if (normalized === 'exploratory') return 1;
+  const match = normalized.match(/^exploratory:(\d+)$/);
+  if (!match) return null;
+  const count = Number.parseInt(match[1], 10);
+  return count > 0 ? count : null;
+}
+
 async function runSuite() {
   const target = process.argv[2];
   const parsedInterval = Number.parseInt(process.argv[3], 10);
   const intervalSec =
     Number.isNaN(parsedInterval) || parsedInterval < 0 ? 60 : parsedInterval;
 
-  if (!target) {
-    console.log('\n========== [EXPLORATORY MODE] ==========');
-    const result = await runAgents(null);
-    saveEvidenceReport([result], 'exploratory');
-    console.log('\n✅ Exploratory run finished.');
+  const fileTimestamp = new Date().toISOString().slice(0, 19).replace(/:/g, '-');
+
+  const exploratoryCount = !target ? 1 : parseExploratoryTarget(target);
+  if (exploratoryCount !== null) {
+    const targetLabel =
+      exploratoryCount > 1 ? `exploratory_x${exploratoryCount}` : 'exploratory';
+    const evidenceFilename = `run-${fileTimestamp}_${targetLabel}.md`;
+    const evidenceLink = `${EVIDENCE_BASE_URL}/${evidenceFilename}`;
+
+    const results = [];
+    for (let i = 0; i < exploratoryCount; i++) {
+      console.log(
+        `\n========== [EXPLORATORY MODE] run ${i + 1}/${exploratoryCount} ==========`
+      );
+      const runId = buildRunId(i);
+      const result = await runAgents(null, { runId, evidenceLink });
+      results.push(result);
+
+      if (i < exploratoryCount - 1) {
+        console.log(`⏳ Waiting ${intervalSec}s before next exploratory run...`);
+        await sleep(intervalSec * 1000);
+      }
+    }
+
+    saveEvidenceReport(results, targetLabel, evidenceFilename);
+    console.log('\n✅ Exploratory run(s) finished.');
     return;
   }
 
@@ -625,15 +763,20 @@ async function runSuite() {
 
   if (!list) {
     console.error(
-      `❌ Invalid target "${target}". Use a single ID (PAY-005), a range (PAY-006..PAY-011), a list (PAY-004,PAY-006), or "all".`
+      `❌ Invalid target "${target}". Use a single ID (PAY-005), a range (PAY-006..PAY-011), a list (PAY-004,PAY-006), "all", or "exploratory:N".`
     );
     return;
   }
 
+  const safeTarget = target.replace(/[^a-zA-Z0-9._-]/g, '_');
+  const evidenceFilename = `run-${fileTimestamp}_${safeTarget}.md`;
+  const evidenceLink = `${EVIDENCE_BASE_URL}/${evidenceFilename}`;
+
   const results = [];
   for (let i = 0; i < list.length; i++) {
     console.log(`\n========== [${list[i].id}] run ${i + 1}/${list.length} ==========`);
-    const result = await runAgents(list[i]);
+    const runId = buildRunId(i);
+    const result = await runAgents(list[i], { runId, evidenceLink });
     results.push(result);
 
     if (i < list.length - 1) {
@@ -642,7 +785,7 @@ async function runSuite() {
     }
   }
 
-  saveEvidenceReport(results, target);
+  saveEvidenceReport(results, target, evidenceFilename);
   console.log('\n✅ Suite execution finished.');
 }
 
